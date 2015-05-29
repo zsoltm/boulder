@@ -37,6 +37,8 @@ cfssl = subprocess.Popen('''
 
 def run_test():
     os.chdir('test/js')
+    if subprocess.Popen('npm install').wait() != 0:
+        sys.exit(1)
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     # Wait up to 7 seconds for Boulder to come up.
