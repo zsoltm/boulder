@@ -212,6 +212,10 @@ func AmqpChannel(conf Config) (*amqp.Channel, error) {
 
 	log := blog.GetAuditLogger()
 
+	if !strings.HasPrefix(conf.AMQP.Server, "amqps:") {
+		return nil, fmt.Errorf("AMQP server URI must be an 'amqps' URI")
+	}
+
 	if conf.AMQP.TLS == nil {
 		// Configuration did not specify TLS options, but Dial will
 		// use TLS anyway if the URL scheme is "amqps"
