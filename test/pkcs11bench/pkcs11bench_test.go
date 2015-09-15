@@ -5,11 +5,13 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"flag"
+	"fmt"
 	"math/big"
 	"testing"
 	"time"
 
 	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/cloudflare/cfssl/crypto/pkcs11key"
+	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/miekg/pkcs11"
 )
 
 var module = flag.String("module", "", "Path to PKCS11 module")
@@ -17,6 +19,18 @@ var tokenLabel = flag.String("tokenLabel", "", "Token label")
 var pin = flag.String("pin", "", "PIN")
 var privateKeyLabel = flag.String("privateKeyLabel", "", "Private key label")
 var slotID = flag.Int("slotID", -1, "Slot")
+
+func initPKCS11Context(modulePath string) (*pkcs11.Ctx, error) {
+	context := pkcs11.New(modulePath)
+
+	// Set up a new pkcs11 object and initialize it
+	if context == nil {
+		return nil, fmt.Errorf("unable to load PKCS#11 module")
+	}
+
+	err := context.Initialize()
+	return context, err
+}
 
 // BenchmarkPKCS11 signs a certificate repeatedly using a PKCS11 token and
 // measures speed. To run:
@@ -34,9 +48,16 @@ func BenchmarkPKCS11(b *testing.B) {
 		b.Fatal("Must pass all flags: module, tokenLabel, pin, privateKeyLabel, and slotID")
 		return
 	}
+	
+	context, err := initPKCS11Context(*module)
+	if err != nil {
+		b.Fatal(err)
+		return
+	}
+
 	// NOTE: To run this test, you will need to edit the following values to match
 	// your PKCS11 token.
-	p, err := pkcs11key.New(*module, *tokenLabel, *pin, *privateKeyLabel, *slotID)
+	p, err := pkcs11key.New(context, *tokenLabel, *pin, *privateKeyLabel, *slotID)
 	if err != nil {
 		b.Fatal(err)
 		return
@@ -61,11 +82,13 @@ func BenchmarkPKCS11(b *testing.B) {
 	// Reset the benchmarking timer so we don't include setup time.
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		_, err = x509.CreateCertificate(rand.Reader, &template, &template, template.PublicKey, p)
-		if err != nil {
-			b.Fatal(err)
-			return
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, err = x509.CreateCertificate(rand.Reader, &template, &template, template.PublicKey, p)
+			if err != nil {
+				b.Fatal(err)
+				return
+			}
 		}
-	}
+	})
 }

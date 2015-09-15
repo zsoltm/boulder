@@ -51,20 +51,13 @@ type PKCS11Key struct {
 
 	// The an ObjectHandle pointing to the private key on the HSM.
 	privateKeyHandle pkcs11.ObjectHandle
+	privateKeyLabel string
 }
 
 // New instantiates a new handle to a PKCS #11-backed key.
-func New(module, tokenLabel, pin, privLabel string, slotID int) (ps *PKCS11Key, err error) {
-	// Set up a new pkcs11 object and initialize it
-	p := pkcs11.New(module)
-	if p == nil {
-		err = errors.New("unable to load PKCS#11 module")
-		return
-	}
-
-	if err = p.Initialize(); err != nil {
-		return
-	}
+func New(context *pkcs11.Ctx, tokenLabel, pin, privLabel string, slotID int) (ps *PKCS11Key, err error) {
+	// XXX
+	p := context
 
 	// Initialize a partial key
 	ps = &PKCS11Key{
@@ -75,7 +68,8 @@ func New(module, tokenLabel, pin, privLabel string, slotID int) (ps *PKCS11Key, 
 	}
 
 	// Look up the private key
-	session, err := ps.openSession()
+	ps.privateKeyLabel = privLabel
+	session, _, err := ps.openSession()
 	if err != nil {
 		ps.Destroy()
 		return
@@ -164,7 +158,8 @@ func (ps *PKCS11Key) Destroy() {
 	}
 }
 
-func (ps *PKCS11Key) openSession() (session pkcs11.SessionHandle, err error) {
+func (ps *PKCS11Key) openSession() (session pkcs11.SessionHandle, privateKeyHandle pkcs11.ObjectHandle, err error) {
+
 	// Check if there is a PCKS11 token with slots. It has side-effects that
 	// allow the rest of the code here to work.
 	_, err = ps.module.GetSlotList(true)
@@ -188,15 +183,41 @@ func (ps *PKCS11Key) openSession() (session pkcs11.SessionHandle, err error) {
 	// Open session
 	session, err = ps.module.OpenSession(slotID, pkcs11.CKF_SERIAL_SESSION)
 	if err != nil {
-		return session, err
+		return session, privateKeyHandle, err
 	}
 
 	// Login
 	if err = ps.module.Login(session, pkcs11.CKU_USER, ps.pin); err != nil {
-		return session, err
+		return session, privateKeyHandle, err
 	}
 
-	return session, err
+	template := []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PRIVATE_KEY),
+		pkcs11.NewAttribute(pkcs11.CKA_LABEL, ps.privateKeyLabel),
+	}
+	p := ps.module
+	if err = p.FindObjectsInit(session, template); err != nil {
+		ps.Destroy()
+		return
+	}
+	objs, _, err := p.FindObjects(session, 2)
+	if err != nil {
+		ps.Destroy()
+		return
+	}
+	if err = p.FindObjectsFinal(session); err != nil {
+		ps.Destroy()
+		return
+	}
+
+	if len(objs) == 0 {
+		err = errors.New("private key not found")
+		ps.Destroy()
+		return
+	}
+	privateKeyHandle = objs[0]
+
+	return session, privateKeyHandle, err
 }
 
 func (ps *PKCS11Key) closeSession(session pkcs11.SessionHandle) {
@@ -230,16 +251,16 @@ func (ps *PKCS11Key) Sign(rand io.Reader, msg []byte, opts crypto.SignerOpts) (s
 	signatureInput := append(prefix, msg...)
 
 	// Open a session
-	session, err := ps.openSession()
+	session, keyHandle, err := ps.openSession()
 	if err != nil {
-		return
+		return nil, fmt.Errorf("openSession problem: %s", err)
 	}
 	defer ps.closeSession(session)
 
 	// Perform the sign operation
-	err = ps.module.SignInit(session, mechanism, ps.privateKeyHandle)
+	err = ps.module.SignInit(session, mechanism, keyHandle)
 	if err != nil {
-		return
+		return nil, fmt.Errorf("SignInit problem: %s", err)
 	}
 
 	signature, err = ps.module.Sign(session, signatureInput)

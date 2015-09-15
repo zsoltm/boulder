@@ -1,0 +1,2 @@
+Put this in your bashrc:
+export SOFTHSM_CONF=$GOPATH/src/github.com/letsencrypt/boulder/test/softhsm
