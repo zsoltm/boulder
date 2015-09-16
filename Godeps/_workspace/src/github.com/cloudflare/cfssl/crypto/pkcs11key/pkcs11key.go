@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"sync"
 
 	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/miekg/pkcs11"
 )
@@ -51,66 +52,87 @@ type PKCS11Key struct {
 
 	// The an ObjectHandle pointing to the private key on the HSM.
 	privateKeyHandle pkcs11.ObjectHandle
-	privateKeyLabel string
+
+	session *pkcs11.SessionHandle
+	sessionMu sync.Mutex
 }
 
 // New instantiates a new handle to a PKCS #11-backed key.
-func New(context *pkcs11.Ctx, tokenLabel, pin, privLabel string, slotID int) (ps *PKCS11Key, err error) {
-	// XXX
-	p := context
-
+// Each PKCS11Key represents one logged-in session. Its session object is
+// protected internally by a mutex. For best performance you may want to
+// instantiate multiple PKCS11Keys. Each one will have its own session and can
+// be used concurrently (assuming the module supports multiple sessions, which
+// some smartcards like the Yubikey Neo may not).
+func New(context *pkcs11.Ctx, tokenLabel, pin, privateKeyLabel string, slotID int) (ps *PKCS11Key, err error) {
 	// Initialize a partial key
 	ps = &PKCS11Key{
-		module:     p,
+		module:     context,
 		slotID:     slotID,
 		tokenLabel: tokenLabel,
 		pin:        pin,
 	}
 
-	// Look up the private key
-	ps.privateKeyLabel = privLabel
-	session, _, err := ps.openSession()
+	// Open a session
+	ps.sessionMu.Lock()
+	defer ps.sessionMu.Unlock()
+	session, err := ps.openSession()
 	if err != nil {
-		ps.Destroy()
 		return
 	}
-	defer ps.closeSession(session)
+	ps.session = &session
 
+	// Fetch the private key by its label
+	privateKeyHandle, err := getPrivateKey(context, session, privateKeyLabel)
+	if err != nil {
+		ps.closeSession(session)
+		return
+	}
+	ps.privateKeyHandle = privateKeyHandle
+
+	publicKey, err := getPublicKey(context, session, privateKeyHandle)
+	if err != nil {
+		ps.closeSession(session)
+		return
+	}
+	ps.publicKey = publicKey
+
+	return
+}
+
+func getPrivateKey(context *pkcs11.Ctx, session pkcs11.SessionHandle, label string) (pkcs11.ObjectHandle, error) {
+	var noHandle pkcs11.ObjectHandle
 	template := []*pkcs11.Attribute{
 		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PRIVATE_KEY),
-		pkcs11.NewAttribute(pkcs11.CKA_LABEL, privLabel),
+		pkcs11.NewAttribute(pkcs11.CKA_LABEL, label),
 	}
-	if err = p.FindObjectsInit(session, template); err != nil {
-		ps.Destroy()
-		return
+	if err := context.FindObjectsInit(session, template); err != nil {
+		return noHandle, err
 	}
-	objs, _, err := p.FindObjects(session, 2)
+	objs, _, err := context.FindObjects(session, 2)
 	if err != nil {
-		ps.Destroy()
-		return
+		return noHandle, err
 	}
-	if err = p.FindObjectsFinal(session); err != nil {
-		ps.Destroy()
-		return
+	if err = context.FindObjectsFinal(session); err != nil {
+		return noHandle, err
 	}
 
 	if len(objs) == 0 {
-		err = errors.New("private key not found")
-		ps.Destroy()
-		return
+		return noHandle, fmt.Errorf("private key not found")
 	}
-	ps.privateKeyHandle = objs[0]
+	return objs[0], nil
+}
 
-	// Populate the pubic key from the private key
-	// TODO: Add support for non-RSA keys, switching on CKA_KEY_TYPE
-	template = []*pkcs11.Attribute{
+// Get the public key matching a private key
+// TODO: Add support for non-RSA keys, switching on CKA_KEY_TYPE
+func getPublicKey(context *pkcs11.Ctx, session pkcs11.SessionHandle, privateKeyHandle pkcs11.ObjectHandle) (rsa.PublicKey, error) {
+	var noKey rsa.PublicKey
+	template := []*pkcs11.Attribute{
 		pkcs11.NewAttribute(pkcs11.CKA_MODULUS, nil),
 		pkcs11.NewAttribute(pkcs11.CKA_PUBLIC_EXPONENT, nil),
 	}
-	attr, err := p.GetAttributeValue(session, ps.privateKeyHandle, template)
+	attr, err := context.GetAttributeValue(session, privateKeyHandle, template)
 	if err != nil {
-		ps.Destroy()
-		return
+		return noKey, err
 	}
 
 	n := big.NewInt(0)
@@ -128,16 +150,14 @@ func New(context *pkcs11.Ctx, tokenLabel, pin, privLabel string, slotID int) (ps
 		}
 	}
 	if !gotModulus || !gotExponent {
-		ps.Destroy()
-		return
+		return noKey, errors.New("public key missing either modulus or exponent")
 	}
-	ps.publicKey = rsa.PublicKey{
+	return rsa.PublicKey{
 		N: n,
 		E: e,
-	}
-
-	return
+	}, nil
 }
+
 
 // Destroy tears down a PKCS11Key.
 //
@@ -152,14 +172,15 @@ func New(context *pkcs11.Ctx, tokenLabel, pin, privLabel string, slotID int) (ps
 //   if err != nil { ... }
 //   defer ps.Destroy()
 func (ps *PKCS11Key) Destroy() {
-	if ps.module != nil {
-		ps.module.Finalize()
-		ps.module.Destroy()
+	if ps.session != nil {
+		ps.sessionMu.Lock()
+		ps.closeSession(*ps.session)
+		ps.session = nil
+		ps.sessionMu.Unlock()
 	}
 }
 
-func (ps *PKCS11Key) openSession() (session pkcs11.SessionHandle, privateKeyHandle pkcs11.ObjectHandle, err error) {
-
+func (ps *PKCS11Key) openSession() (session pkcs11.SessionHandle, err error) {
 	// Check if there is a PCKS11 token with slots. It has side-effects that
 	// allow the rest of the code here to work.
 	_, err = ps.module.GetSlotList(true)
@@ -183,41 +204,15 @@ func (ps *PKCS11Key) openSession() (session pkcs11.SessionHandle, privateKeyHand
 	// Open session
 	session, err = ps.module.OpenSession(slotID, pkcs11.CKF_SERIAL_SESSION)
 	if err != nil {
-		return session, privateKeyHandle, err
+		return session, err
 	}
 
 	// Login
 	if err = ps.module.Login(session, pkcs11.CKU_USER, ps.pin); err != nil {
-		return session, privateKeyHandle, err
+		return session, err
 	}
 
-	template := []*pkcs11.Attribute{
-		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PRIVATE_KEY),
-		pkcs11.NewAttribute(pkcs11.CKA_LABEL, ps.privateKeyLabel),
-	}
-	p := ps.module
-	if err = p.FindObjectsInit(session, template); err != nil {
-		ps.Destroy()
-		return
-	}
-	objs, _, err := p.FindObjects(session, 2)
-	if err != nil {
-		ps.Destroy()
-		return
-	}
-	if err = p.FindObjectsFinal(session); err != nil {
-		ps.Destroy()
-		return
-	}
-
-	if len(objs) == 0 {
-		err = errors.New("private key not found")
-		ps.Destroy()
-		return
-	}
-	privateKeyHandle = objs[0]
-
-	return session, privateKeyHandle, err
+	return session, err
 }
 
 func (ps *PKCS11Key) closeSession(session pkcs11.SessionHandle) {
@@ -232,6 +227,12 @@ func (ps *PKCS11Key) Public() crypto.PublicKey {
 
 // Sign performs a signature using the PKCS #11 key.
 func (ps *PKCS11Key) Sign(rand io.Reader, msg []byte, opts crypto.SignerOpts) (signature []byte, err error) {
+	ps.sessionMu.Lock()
+	defer ps.sessionMu.Unlock()
+	if ps.session == nil {
+		return nil, errors.New("Session was nil")
+	}
+
 	// Verify that the length of the hash is as expected
 	hash := opts.HashFunc()
 	hashLen := hash.Size()
@@ -250,19 +251,12 @@ func (ps *PKCS11Key) Sign(rand io.Reader, msg []byte, opts crypto.SignerOpts) (s
 	}
 	signatureInput := append(prefix, msg...)
 
-	// Open a session
-	session, keyHandle, err := ps.openSession()
-	if err != nil {
-		return nil, fmt.Errorf("openSession problem: %s", err)
-	}
-	defer ps.closeSession(session)
-
 	// Perform the sign operation
-	err = ps.module.SignInit(session, mechanism, keyHandle)
+	err = ps.module.SignInit(*ps.session, mechanism, ps.privateKeyHandle)
 	if err != nil {
 		return nil, fmt.Errorf("SignInit problem: %s", err)
 	}
 
-	signature, err = ps.module.Sign(session, signatureInput)
+	signature, err = ps.module.Sign(*ps.session, signatureInput)
 	return
 }
