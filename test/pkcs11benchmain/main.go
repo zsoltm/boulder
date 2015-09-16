@@ -51,20 +51,6 @@ func main() {
 		return
 	}
 
-	p, err := pkcs11key.New(context, *tokenLabel, *pin, *privateKeyLabel, *slotID)
-	if err != nil {
-		log.Fatal(err)
-		return
-	}
-	defer p.Destroy()
-
-	p2, err := pkcs11key.New(context, *tokenLabel, *pin, *privateKeyLabel, *slotID)
-	if err != nil {
-		log.Fatal(err)
-		return
-	}
-	defer p2.Destroy()
-
 	N := big.NewInt(1)
 	N.Lsh(N, 6000)
 	// A minimal, bogus certificate to be signed.
@@ -80,7 +66,10 @@ func main() {
 		},
 	}
 
-	loopdeloop := func(pre string, p *pkcs11key.PKCS11Key) {
+	const count = 1000
+	signRequests := make(chan chan int, count)
+
+	loopdeloop := func(pre string) {
 		p, err := pkcs11key.New(context, *tokenLabel, *pin, *privateKeyLabel, *slotID)
 		if err != nil {
 			log.Fatal(err)
@@ -88,29 +77,29 @@ func main() {
 		}
 		defer p.Destroy()
 
-		for ;; {
+		for replyChan := range signRequests {
 			_, err = x509.CreateCertificate(rand.Reader, &template, &template, template.PublicKey, p)
+			replyChan <- 1
 			if err != nil {
 				log.Fatalf("%s %s\n", pre, err)
 				return
-			} else {
-				//log.Println(pre, ".")
 			}
 		}
 	}
-	go loopdeloop("a", p)
-	go loopdeloop("b", p2)
-	go loopdeloop("c", p2)
-	go loopdeloop("d", p2)
-	go loopdeloop("e", p2)
-	go loopdeloop("f", p2)
-	go loopdeloop("g", p2)
-	go loopdeloop("h", p2)
-	go loopdeloop("i", p2)
-	go loopdeloop("j", p2)
-	go loopdeloop("k", p2)
-	go loopdeloop("l", p2)
-	go loopdeloop("m", p2)
-	go loopdeloop("n", p2)
-	time.Sleep(10000 * time.Second)
+	go loopdeloop("a")
+	go loopdeloop("b")
+	go loopdeloop("c")
+	go loopdeloop("d")
+
+	replyChan := make(chan int)
+
+	start := time.Now()
+	for i := 0; i < count; i++ {
+		signRequests <- replyChan
+	}
+	for i := 0; i < count; i++ {
+		_ = <- replyChan
+	}
+	fmt.Printf("done: %d ns / op\n", int64(time.Now().Sub(start)) / count)
+
 }
