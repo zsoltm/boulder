@@ -1,4 +1,4 @@
-package pkcs11bench
+package main
 
 import (
 	"crypto/rand"
@@ -6,8 +6,8 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
+	"log"
 	"math/big"
-	"testing"
 	"time"
 
 	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/cloudflare/cfssl/crypto/pkcs11key"
@@ -43,15 +43,16 @@ func initPKCS11Context(modulePath string) (*pkcs11.Ctx, error) {
 // pkcs11key logs into the token before each signing operation (which is probably a
 // performance bug). Also note that some PKCS11 modules (opensc) are not
 // threadsafe.
-func BenchmarkPKCS11(b *testing.B) {
+func main() {
+	flag.Parse()
 	if *module == "" || *tokenLabel == "" || *pin == "" || *privateKeyLabel == "" || *slotID == -1 {
-		b.Fatal("Must pass all flags: module, tokenLabel, pin, privateKeyLabel, and slotID")
+		log.Fatal("Must pass all flags: module, tokenLabel, pin, privateKeyLabel, and slotID")
 		return
 	}
 	
 	context, err := initPKCS11Context(*module)
 	if err != nil {
-		b.Fatal(err)
+		log.Fatal(err)
 		return
 	}
 
@@ -59,7 +60,7 @@ func BenchmarkPKCS11(b *testing.B) {
 	// your PKCS11 token.
 	p, err := pkcs11key.New(context, *tokenLabel, *pin, *privateKeyLabel, *slotID)
 	if err != nil {
-		b.Fatal(err)
+		log.Fatal(err)
 		return
 	}
 	defer p.Destroy()
@@ -79,16 +80,18 @@ func BenchmarkPKCS11(b *testing.B) {
 		},
 	}
 
-	// Reset the benchmarking timer so we don't include setup time.
-	b.ResetTimer()
-
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
+	loopdeloop := func(pre string) {
+		for ;; {
 			_, err = x509.CreateCertificate(rand.Reader, &template, &template, template.PublicKey, p)
 			if err != nil {
-				b.Fatal(err)
+				log.Fatalf("%s %s\n", pre, err)
 				return
+			} else {
+				log.Println(pre, ".")
 			}
 		}
-	})
+	}
+	go loopdeloop("a")
+	go loopdeloop("b")
+	time.Sleep(10000 * time.Second)
 }
