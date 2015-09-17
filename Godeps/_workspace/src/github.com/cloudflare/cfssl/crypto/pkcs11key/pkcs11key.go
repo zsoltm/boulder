@@ -1,7 +1,9 @@
 // +build !nopkcs11
 
 // Package pkcs11key implements crypto.Signer for PKCS #11 private
-// keys. Currently, only RSA keys are support.
+// keys. Currently, only RSA keys are supported.
+// See ftp://ftp.rsasecurity.com/pub/pkcs/pkcs-11/v2-30/pkcs-11v2-30b-d6.pdf for
+// details of the Cryptoki PKCS#11 API.
 package pkcs11key
 
 import (
@@ -84,14 +86,14 @@ func New(context *pkcs11.Ctx, tokenLabel, pin, privateKeyLabel string, slotID in
 	// Fetch the private key by its label
 	privateKeyHandle, err := getPrivateKey(context, session, privateKeyLabel)
 	if err != nil {
-		ps.closeSession(session)
+		ps.module.CloseSession(session)
 		return
 	}
 	ps.privateKeyHandle = privateKeyHandle
 
 	publicKey, err := getPublicKey(context, session, privateKeyHandle)
 	if err != nil {
-		ps.closeSession(session)
+		ps.module.CloseSession(session)
 		return
 	}
 	ps.publicKey = publicKey
@@ -159,22 +161,18 @@ func getPublicKey(context *pkcs11.Ctx, session pkcs11.SessionHandle, privateKeyH
 }
 
 
-// Destroy tears down a PKCS11Key.
-//
-// This method must be called before the PKCS11Key is GC'ed, in order
-// to ensure that the PKCS#11 module itself is properly finalized and
-// destroyed.
-//
-// The idiomatic way to do this (assuming no need for a long-lived
-// signer) is as follows:
-//
-//   ps, err := NewPKCS11Signer(...)
-//   if err != nil { ... }
-//   defer ps.Destroy()
+// Destroy tears down a PKCS11Key by closing the session. It should be
+// called before the key gets GC'ed, to avoid leaving dangling sessions.
+// NOTE: We do not want to call module.Logout here. module.Logout applies
+// application-wide, so even if there are other sessions that still want to be
+// logged in, they would be logged out, causing CKR_OBJECT_HANDLE_INVALID next
+// time we try to sign something. It's also unnecessary to log out explicitly:
+// module.CloseSession will log out once the last session in the application is
+// closed.
 func (ps *PKCS11Key) Destroy() {
 	if ps.session != nil {
 		ps.sessionMu.Lock()
-		ps.closeSession(*ps.session)
+		ps.module.CloseSession(*ps.session)
 		ps.session = nil
 		ps.sessionMu.Unlock()
 	}
@@ -213,11 +211,6 @@ func (ps *PKCS11Key) openSession() (session pkcs11.SessionHandle, err error) {
 	}
 
 	return session, err
-}
-
-func (ps *PKCS11Key) closeSession(session pkcs11.SessionHandle) {
-	ps.module.Logout(session)
-	ps.module.CloseSession(session)
 }
 
 // Public returns the public key for the PKCS #11 key.
