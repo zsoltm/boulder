@@ -5,7 +5,6 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"flag"
-	"fmt"
 	"math/big"
 	"testing"
 	"time"
@@ -18,25 +17,12 @@ var module = flag.String("module", "", "Path to PKCS11 module")
 var tokenLabel = flag.String("tokenLabel", "", "Token label")
 var pin = flag.String("pin", "", "PIN")
 var privateKeyLabel = flag.String("privateKeyLabel", "", "Private key label")
-var slotID = flag.Int("slotID", -1, "Slot")
-
-func initPKCS11Context(modulePath string) (*pkcs11.Ctx, error) {
-	context := pkcs11.New(modulePath)
-
-	// Set up a new pkcs11 object and initialize it
-	if context == nil {
-		return nil, fmt.Errorf("unable to load PKCS#11 module")
-	}
-
-	err := context.Initialize()
-	return context, err
-}
 
 var context *pkcs11.Ctx
 func init() {
 	flag.Parse()
 	var err error
-	context, err = initPKCS11Context(*module)
+	context, err = pkcs11key.Initialize(*module)
 	if err != nil {
 		panic("Failed to init PKCS11 module: " + err.Error())
 	}
@@ -46,22 +32,20 @@ func init() {
 // measures speed. To run:
 // go test -bench=. -benchtime 1m ./test/pkcs11bench/ \
 //   -module /usr/lib/softhsm/libsofthsm.so -token-label "softhsm token" \
-//   -pin 1234 -private-key-label "my key" -slot-id 7 -v
+//   -pin 1234 -private-key-label "my key"
 // You can adjust benchtime if you want to run for longer or shorter.
-// TODO: Parallel benchmarking. Currently if you try this with a Yubikey Neo,
-// you will get a bunch of CKR_USER_ALREADY_LOGGED_IN errors. This is because
-// pkcs11key logs into the token before each signing operation (which is probably a
-// performance bug). Also note that some PKCS11 modules (opensc) are not
-// threadsafe.
 func BenchmarkPKCS11(b *testing.B) {
-	if *module == "" || *tokenLabel == "" || *pin == "" || *privateKeyLabel == "" || *slotID == -1 {
-		b.Fatal("Must pass all flags: module, tokenLabel, pin, privateKeyLabel, and slotID")
+	if *module == "" || *tokenLabel == "" || *pin == "" || *privateKeyLabel == "" {
+		b.Fatal("Must pass all flags: module, tokenLabel, pin, and privateKeyLabel")
 		return
 	}
 
+	// A minimal, bogus certificate to be signed.
+	// Note: we choose a large N to make up for some of the missing fields in the
+	// bogus certificate, so we wind up something approximately the size of a real
+	// certificate.
 	N := big.NewInt(1)
 	N.Lsh(N, 6000)
-	// A minimal, bogus certificate to be signed.
 	template := x509.Certificate{
 		SerialNumber:       big.NewInt(1),
 		PublicKeyAlgorithm: x509.RSA,
@@ -78,7 +62,7 @@ func BenchmarkPKCS11(b *testing.B) {
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
-		p, err := pkcs11key.New(context, *tokenLabel, *pin, *privateKeyLabel, *slotID)
+		p, err := pkcs11key.New(context, "", *tokenLabel, *pin, *privateKeyLabel)
 		if err != nil {
 			b.Fatal(err)
 			return

@@ -34,15 +34,21 @@ var hashPrefixes = map[crypto.Hash][]byte{
 // using a key stored in a PKCS#11 hardware token.  This enables
 // the use of PKCS#11 tokens with the Go x509 library's methods
 // for signing certificates.
+//
+// Each PKCS11Key represents one session. Its session handle is
+// protected internally by a mutex, so at most one Sign operation can be active
+// at a time. For best performance you may want to instantiate multiple PKCS11Keys.
+// Each one will have its own session and can be used concurrently. Note that
+// some smartcards like the Yubikey Neo do not support multiple simultaneous
+// sessions and will error out on creation of the second PKCS11Key object.
 type PKCS11Key struct {
 	// The PKCS#11 library to use
 	module *pkcs11.Ctx
 
-	// The slot id of the token to be used. Both this and tokenLabel must match to
-	// be used.
-	slotID int
+	// The name of the slot to be used, or "" to use any slot
+	slotDescription string
 
-	// The label of the token to be used.
+	// The label of the token to be used (mandatory).
 	// We will automatically search for this in the slot list.
 	tokenLabel string
 
@@ -55,23 +61,41 @@ type PKCS11Key struct {
 	// The an ObjectHandle pointing to the private key on the HSM.
 	privateKeyHandle pkcs11.ObjectHandle
 
+	// A handle to the session used by this KCS11Key.
 	session *pkcs11.SessionHandle
 	sessionMu sync.Mutex
 }
 
+// LoadModule loads the give PKCS#11 module (shared library). It should be
+// called exactly once per process, and the return value should be passed to
+// each call to New.
+func Initialize(modulePath string) (*pkcs11.Ctx, error) {
+	context := pkcs11.New(modulePath)
+
+	if context == nil {
+		return nil, fmt.Errorf("unable to load PKCS#11 module")
+	}
+
+	err := context.Initialize()
+	return context, err
+}
+
+// Finalize cleans up PKCS#11-related state. It is mostly useful when forking
+// off child processes where the parent process had already called Initialize.
+// See ftp://ftp.rsasecurity.com/pub/pkcs/pkcs-11/v2-30/pkcs-11v2-30b-d6.pdf,
+// section 6.6.
+func Finalize(context *pkcs11.Ctx) error {
+	return context.Finalize()
+}
+
 // New instantiates a new handle to a PKCS #11-backed key.
-// Each PKCS11Key represents one logged-in session. Its session object is
-// protected internally by a mutex. For best performance you may want to
-// instantiate multiple PKCS11Keys. Each one will have its own session and can
-// be used concurrently (assuming the module supports multiple sessions, which
-// some smartcards like the Yubikey Neo may not).
-func New(context *pkcs11.Ctx, tokenLabel, pin, privateKeyLabel string, slotID int) (ps *PKCS11Key, err error) {
+func New(context *pkcs11.Ctx, slotDescription, tokenLabel, pin, privateKeyLabel string) (ps *PKCS11Key, err error) {
 	// Initialize a partial key
 	ps = &PKCS11Key{
-		module:     context,
-		slotID:     slotID,
-		tokenLabel: tokenLabel,
-		pin:        pin,
+		module:          context,
+		slotDescription: slotDescription,
+		tokenLabel:      tokenLabel,
+		pin:             pin,
 	}
 
 	// Open a session
@@ -178,39 +202,54 @@ func (ps *PKCS11Key) Destroy() {
 	}
 }
 
-func (ps *PKCS11Key) openSession() (session pkcs11.SessionHandle, err error) {
+func (ps *PKCS11Key) openSession() (pkcs11.SessionHandle, error) {
+	var noSession pkcs11.SessionHandle
 	// Check if there is a PCKS11 token with slots. It has side-effects that
 	// allow the rest of the code here to work.
-	_, err = ps.module.GetSlotList(true)
+	slots, err := ps.module.GetSlotList(true)
 	if err != nil {
-		return
+		return noSession, err
 	}
 
-	slotID := uint(ps.slotID)
-	// Look up slot by id
-	tokenInfo, err := ps.module.GetTokenInfo(slotID)
-	if err != nil {
-		return
-	}
+	for _, slot := range slots {
+		// If ps.slotDescription is provided, only check matching slots
+		if ps.slotDescription != "" {
+			slotInfo, err := ps.module.GetSlotInfo(slot)
+			if err != nil {
+				return noSession, err
+			}
+			if slotInfo.SlotDescription != ps.slotDescription {
+				continue
+			}
+		}
 
-	// Check that token label matches.
-	if tokenInfo.Label != ps.tokenLabel {
-		err = fmt.Errorf("Token label in slot %d was '%s', expected '%s'",
-			slotID, tokenInfo.Label, ps.tokenLabel)
-		return
-	}
-	// Open session
-	session, err = ps.module.OpenSession(slotID, pkcs11.CKF_SERIAL_SESSION)
-	if err != nil {
+		// Check that token label matches.
+		tokenInfo, err := ps.module.GetTokenInfo(slot)
+		if err != nil {
+			return noSession, err
+		}
+		if tokenInfo.Label != ps.tokenLabel {
+			continue
+		}
+
+		// Open session
+		session, err := ps.module.OpenSession(slot, pkcs11.CKF_SERIAL_SESSION)
+		if err != nil {
+			return session, err
+		}
+
+		// Login
+		// Note: Logged-in status is application-wide, not per session. But in
+		// practice it appears to be okay to login to a token multiple times with the same
+		// credentials.
+		if err = ps.module.Login(session, pkcs11.CKU_USER, ps.pin); err != nil {
+			ps.module.CloseSession(session)
+			return session, err
+		}
+
 		return session, err
 	}
-
-	// Login
-	if err = ps.module.Login(session, pkcs11.CKU_USER, ps.pin); err != nil {
-		return session, err
-	}
-
-	return session, err
+	return noSession, fmt.Errorf("No slot fond matching token label '%s'", ps.tokenLabel)
 }
 
 // Public returns the public key for the PKCS #11 key.
