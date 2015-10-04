@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"testing"
 	"time"
 
@@ -60,7 +61,7 @@ var (
 )
 
 func TestAddRegistration(t *testing.T) {
-	sa, _, cleanUp := initSA(t)
+	sa, clk, cleanUp := initSA(t)
 	defer cleanUp()
 
 	jwk := satest.GoodJWK()
@@ -71,8 +72,9 @@ func TestAddRegistration(t *testing.T) {
 	}
 	contacts := []*core.AcmeURL{contact}
 	reg, err := sa.NewRegistration(core.Registration{
-		Key:     jwk,
-		Contact: contacts,
+		Key:       jwk,
+		Contact:   contacts,
+		InitialIP: net.ParseIP("43.34.43.34"),
 	})
 	if err != nil {
 		t.Fatalf("Couldn't create new registration: %s", err)
@@ -87,15 +89,23 @@ func TestAddRegistration(t *testing.T) {
 	test.AssertNotError(t, err, fmt.Sprintf("Couldn't get registration with ID %v", reg.ID))
 
 	expectedReg := core.Registration{
-		ID:  reg.ID,
-		Key: jwk,
+		ID:        reg.ID,
+		Key:       jwk,
+		InitialIP: net.ParseIP("43.34.43.34"),
+		CreatedAt: clk.Now(),
 	}
 	test.AssertEquals(t, dbReg.ID, expectedReg.ID)
 	test.Assert(t, core.KeyDigestEquals(dbReg.Key, expectedReg.Key), "Stored key != expected")
 
 	u, _ := core.ParseAcmeURL("test.com")
 
-	newReg := core.Registration{ID: reg.ID, Key: jwk, Contact: []*core.AcmeURL{u}, Agreement: "yes"}
+	newReg := core.Registration{
+		ID:        reg.ID,
+		Key:       jwk,
+		Contact:   []*core.AcmeURL{u},
+		InitialIP: net.ParseIP("72.72.72.72"),
+		Agreement: "yes",
+	}
 	err = sa.UpdateRegistration(newReg)
 	test.AssertNotError(t, err, fmt.Sprintf("Couldn't get registration with ID %v", reg.ID))
 	dbReg, err = sa.GetRegistrationByKey(jwk)

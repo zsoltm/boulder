@@ -13,3 +13,8 @@ certificatesPerName:
     le2.wtf: 10000
     le3.wtf: 10000
     nginx.wtf: 10000
+registrationsPerIP:
+  window: 168h # 1 week
+  threshold: 3
+  overrides:
+    127.0.0.1: 1000000

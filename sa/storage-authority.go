@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 	"time"
@@ -229,6 +230,25 @@ func (ssa *SQLStorageAuthority) GetLatestValidAuthorization(registrationId int64
 	return ssa.GetAuthorization(auth.ID)
 }
 
+func (ssa *SQLStorageAuthority) CountRegistrationsByIP(ip net.IP, earliest time.Time, latest time.Time) (int, error) {
+	var count int64
+	err := ssa.dbMap.SelectOne(
+		&count,
+		`SELECT COUNT(1) FROM registrations
+		 WHERE initialIP = :ip AND
+		 :earliest < createdAt AND
+		 createdAt <= :latest`,
+		map[string]interface{}{
+			"ip":       ip.String(),
+			"earliest": earliest,
+			"latest":   latest,
+		})
+	if err != nil {
+		return -1, err
+	}
+	return int(count), nil
+}
+
 type TooManyCertificatesError string
 
 func (t TooManyCertificatesError) Error() string {
@@ -444,17 +464,32 @@ func (ssa *SQLStorageAuthority) MarkCertificateRevoked(serial string, ocspRespon
 
 // UpdateRegistration stores an updated Registration
 func (ssa *SQLStorageAuthority) UpdateRegistration(reg core.Registration) error {
-	rm, err := registrationToModel(&reg)
+	lookupResult, err := ssa.dbMap.Get(regModel{}, reg.ID)
 	if err != nil {
 		return err
 	}
+	if lookupResult == nil {
+		msg := fmt.Sprintf("No registrations with ID %d", reg.ID)
+		return core.NoSuchRegistrationError(msg)
+	}
+	existingRegModel, ok := lookupResult.(*regModel)
+	if !ok {
+		// Shouldn't happen
+		return fmt.Errorf("Incorrect type returned from registration lookup")
+	}
 
-	n, err := ssa.dbMap.Update(rm)
+	updatedRegModel, err := registrationToModel(&reg)
+	if err != nil {
+		return err
+	}
+	updatedRegModel.LockCol = existingRegModel.LockCol
+
+	n, err := ssa.dbMap.Update(updatedRegModel)
 	if err != nil {
 		return err
 	}
 	if n == 0 {
-		msg := fmt.Sprintf("Requested registration not found %v", reg.ID)
+		msg := fmt.Sprintf("Requested registration not found %d", reg.ID)
 		return core.NoSuchRegistrationError(msg)
 	}
 
