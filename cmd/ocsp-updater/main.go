@@ -43,9 +43,10 @@ type OCSPUpdater struct {
 	// Number of CT logs we expect to have receipts from
 	numLogs int
 
-	newCertificatesLoop    *looper
-	oldOCSPResponsesLoop   *looper
-	missingSCTReceiptsLoop *looper
+	newCertificatesLoop     *looper
+	oldOCSPResponsesLoop    *looper
+	missingSCTReceiptsLoop  *looper
+	revokedCertificatesLoop *looper
 }
 
 // This is somewhat gross but can be pared down a bit once the publisher and this
@@ -100,6 +101,14 @@ func newUpdater(
 		tickDur:   config.MissingSCTWindow.Duration,
 		tickFunc:  updater.missingReceiptsTick,
 		name:      "MissingSCTReceipts",
+	}
+	updater.revokedCertificatesLoop = &looper{
+		clk:       clk,
+		stats:     stats,
+		batchSize: config.RevokedCertificateBatchSize,
+		tickDur:   config.RevokedCertificateWindow.Duration,
+		tickFunc:  updater.revokedCertificatesTick,
+		name:      "RevokedCertificates",
 	}
 
 	updater.ocspMinTimeToExpiry = config.OCSPMinTimeToExpiry.Duration
@@ -214,10 +223,89 @@ func (updater *OCSPUpdater) newCertificateTick(batchSize int) {
 	// OCSP responses
 	statuses, err := updater.getCertificatesWithMissingResponses(batchSize)
 	if err != nil {
+		updater.stats.Inc("OCSP.Errors.FindMissingResponses", 1, 1.0)
+		updater.log.AuditErr(fmt.Errorf("Failed to find certificates with missing OCSP responses: %s", err))
 		return
 	}
 
 	updater.generateOCSPResponses(statuses)
+}
+
+func (updater *OCSPUpdater) findRevokedCertificates(batchSize int) ([]core.CertificateStatus, error) {
+	var statuses []core.CertificateStatus
+	_, err := updater.dbMap.Select(
+		&statuses,
+		`SELECT * FROM certificateStatus
+		 WHERE status = :revoked
+		 AND ocspLastUpdated < revokedDate
+		 LIMIT :limit`,
+		map[string]interface{}{
+			"revoked": string(core.OCSPStatusRevoked),
+			"limit":   batchSize,
+		},
+	)
+	return statuses, err
+}
+
+func (updater *OCSPUpdater) generateRevokedOCSPResponses(statuses []core.CertificateStatus) {
+	for _, status := range statuses {
+		var cert core.Certificate
+		err := updater.dbMap.SelectOne(
+			&cert,
+			`SELECT * FROM certificates
+			 WHERE serial = :serial`,
+			map[string]interface{}{"serial": status.Serial},
+		)
+		if err != nil {
+			updater.stats.Inc("OCSP.Errors.GetCertificate", 1, 1.0)
+			updater.log.AuditErr(fmt.Errorf("Failed to get certificate: %s", err))
+			continue
+		}
+
+		signRequest := core.OCSPSigningRequest{
+			CertDER:   cert.DER,
+			Status:    string(core.OCSPStatusRevoked),
+			Reason:    status.RevokedReason,
+			RevokedAt: updater.clk.Now(),
+		}
+
+		ocspResponse, err := updater.cac.GenerateOCSP(signRequest)
+		if err != nil {
+			updater.stats.Inc("OCSP.Errors.ResponseGeneration", 1, 1.0)
+			updater.log.AuditErr(fmt.Errorf("Failed to Parse certificate: %s", err))
+			continue
+		}
+
+		timestamp := updater.clk.Now()
+		status.OCSPLastUpdated = timestamp
+		err = updater.dbMap.Insert(&core.OCSPResponse{
+			Serial:    cert.Serial,
+			CreatedAt: timestamp,
+			Response:  ocspResponse,
+		})
+		if err != nil {
+			updater.stats.Inc("OCSP.Errors.StoreResponse", 1, 1.0)
+			updater.log.AuditErr(fmt.Errorf("Failed to store OCSP response: %s", err))
+			continue
+		}
+		_, err = updater.dbMap.Update(&status)
+		if err != nil {
+			updater.stats.Inc("OCSP.Errors.UpdateStatus", 1, 1.0)
+			updater.log.AuditErr(fmt.Errorf("Failed to update certificate status: %s", err))
+			continue
+		}
+	}
+}
+
+func (updater *OCSPUpdater) revokedCertificatesTick(batchSize int) {
+	statuses, err := updater.findRevokedCertificates(batchSize)
+	if err != nil {
+		updater.stats.Inc("OCSP.Errors.FindRevokedCertificates", 1, 1.0)
+		updater.log.AuditErr(fmt.Errorf("Failed to find revoked certificates: %s", err))
+		return
+	}
+
+	updater.generateRevokedOCSPResponses(statuses)
 }
 
 func (updater *OCSPUpdater) generateOCSPResponses(statuses []core.CertificateStatus) {
@@ -435,6 +523,8 @@ func main() {
 
 		go updater.newCertificatesLoop.loop()
 		go updater.oldOCSPResponsesLoop.loop()
+		go updater.missingSCTReceiptsLoop.loop()
+		go updater.revokedCertificatesLoop.loop()
 
 		cmd.FailOnError(err, "Failed to create updater")
 
